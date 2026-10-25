@@ -5,9 +5,6 @@ on:
     - cron: "0 4 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   log:
     runs-on: ubuntu-latest
@@ -18,10 +15,5 @@ jobs:
           python-version: "3.12"
       - run: pip install requests
       - run: python weather_log.py
-      - name: Commit result
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add weather_log.csv
-          git commit -m "Add weather reading" || echo "Nothing to commit"
-          git push
+        env:
+          SHEET_URL: ${{ secrets.SHEET_URL }}
