@@ -320,3 +320,20 @@ def run_tests():
     print(f"\n{passed} of {len(SCENARIOS)} passed")
  
 
+ # ---------- Start here ----------
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "job"
+    if mode == "ask":
+        print(run_agent(" ".join(sys.argv[2:])))
+    elif mode == "dry":
+        run_job(dry=True)
+    elif mode == "agent":
+        run_agent_job()
+    elif mode == "agent-dry":
+        run_agent_job(dry=True)
+    elif mode == "test":
+        run_tests()
+    else:
+        run_job()
+
+
