@@ -307,7 +307,8 @@ def run_weather_agent(tools=REAL_TOOLS, max_steps=MAX_STEPS):
         "reasoning (two or three sentences explaining your decision with numbers), "
         "send_alert (true or false), "
         "alert_message (a short message, or an empty string if there is no alert), "
-        "sources (a list of the guideline section titles you used, or an empty list)."
+        "sources (a list of the guideline section titles you used, or an empty list).
+        ""Use each tool at most once. Search the guidelines once, then decide. As soon as you have the weather, your history and one guideline search, stop calling tools and reply with the JSON."
     )
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": f"Check the weather for {CITY} and decide what to do."}]
