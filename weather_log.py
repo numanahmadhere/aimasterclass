@@ -1,6 +1,10 @@
 import os
+import re
 import sys
 import json
+import math
+from pathlib import Path
+from time import sleep
 import requests
  
 # ---------- Settings ----------
@@ -60,7 +64,7 @@ def get_json(prompt, keys):
         text = ask_groq(
             [{"role": "system", "content": "Reply with JSON only. No extra text."},
              {"role": "user", "content": prompt}],
-            temperature=1.5,
+            temperature=0.2,
         )["content"].strip()
         text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         try:
@@ -156,10 +160,63 @@ def run_agent(question, max_steps=5):
     return "Stopped: too many steps"
  
  
-# ---------- Start here ----------
-# ---------- 5. The weather agent: the AI decides what to check and whether to alert ----------
-from time import sleep
  
+ 
+# ---------- 5. Knowledge: search your own guidelines file (RAG) ----------
+STOP = {"the", "a", "an", "is", "are", "of", "to", "and", "in", "for", "on", "at", "or", "when", "what", "do", "should"}
+ 
+ 
+def load_guidelines(path="guidelines.md"):
+    # Split the file into sections. Every section starts with a line like: ## Heat
+    text = Path(path).read_text(encoding="utf-8")
+    chunks = {}
+    for block in re.split(r"\n(?=## )", text):
+        block = block.strip()
+        if block.startswith("## "):
+            title, _, body = block[3:].partition("\n")
+            chunks[title.strip()] = body.strip()
+    return chunks
+ 
+ 
+def words(text):
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOP]
+ 
+ 
+def search_guidelines(query, k=2):
+    # Score every section by the words it shares with the query. Rarer words count more.
+    chunks = load_guidelines()
+    docs = {t: words(t + " " + b) for t, b in chunks.items()}
+    n = len(docs)
+    scores = {}
+    for title, d in docs.items():
+        s = 0.0
+        for w in set(words(query)):
+            tf = d.count(w)
+            if tf:
+                df = sum(1 for other in docs.values() if w in other)
+                s += (1 + math.log(tf)) * (math.log((n + 1) / df) + 1)
+        scores[title] = s
+    top = sorted(scores, key=scores.get, reverse=True)[:k]
+    return [{"section": t, "text": chunks[t]} for t in top if scores[t] > 0]
+ 
+ 
+def valid_sections():
+    try:
+        return set(load_guidelines())
+    except FileNotFoundError:
+        return set()
+ 
+ 
+def check_sources(decision, valid):
+    # No valid source, no alert
+    srcs = decision.get("sources")
+    good = isinstance(srcs, list) and len(srcs) > 0 and all(s in valid for s in srcs)
+    if decision["send_alert"] and not good:
+        return {**decision, "send_alert": False, "alert_message": ""}
+    return decision
+ 
+ 
+# ---------- 6. The weather agent: the AI decides what to check and whether to alert ----------
 MAX_STEPS = 6   # the agent must finish within this many steps
  
  
@@ -181,7 +238,16 @@ def tool_get_history(n=5):
         return {"error": "could not read history: " + r.text[:100]}
  
  
-REAL_TOOLS = {"get_weather": tool_get_weather, "get_history": tool_get_history}
+def tool_search_guidelines(query):
+    try:
+        return search_guidelines(query)
+    except FileNotFoundError:
+        return {"error": "guidelines.md not found"}
+ 
+ 
+REAL_TOOLS = {"get_weather": tool_get_weather,
+              "get_history": tool_get_history,
+              "search_guidelines": tool_search_guidelines}
  
 AGENT_TOOLS = [
     {"type": "function", "function": {
@@ -195,6 +261,12 @@ AGENT_TOOLS = [
         "description": "Get your own most recent decisions from previous runs: time, city, advice, whether an alert was sent, and the alert message",
         "parameters": {"type": "object",
                        "properties": {"n": {"type": "integer", "description": "how many past runs, 1 to 10"}}}}},
+    {"type": "function", "function": {
+        "name": "search_guidelines",
+        "description": "Search the safety guidelines for rules and thresholds about heat, wind, cold, rain and when to alert. Use it before deciding on an alert.",
+        "parameters": {"type": "object",
+                       "properties": {"query": {"type": "string", "description": "what to look up, for example: heatwave highs above 44"}},
+                       "required": ["query"]}}},
 ]
  
  
@@ -206,7 +278,8 @@ def parse_decision(text):
     except json.JSONDecodeError:
         return None
     ok = (isinstance(d, dict) and isinstance(d.get("advice"), str) and isinstance(d.get("reasoning"), str)
-          and isinstance(d.get("send_alert"), bool) and isinstance(d.get("alert_message"), str))
+          and isinstance(d.get("send_alert"), bool) and isinstance(d.get("alert_message"), str)
+          and isinstance(d.get("sources"), list))
     return d if ok else None
  
  
@@ -214,22 +287,27 @@ def apply_guardrails(d):
     # The AI recommends. Your code decides what is allowed.
     message = d["alert_message"].strip()[:300]            # a short alert only
     send = d["send_alert"] is True and message != ""      # no alert without a message
-    return {"advice": d["advice"].strip(), "reasoning": d["reasoning"].strip(),
-            "send_alert": send, "alert_message": message if send else ""}
+    sources = [s for s in d["sources"] if isinstance(s, str)]
+    decision = {"advice": d["advice"].strip(), "reasoning": d["reasoning"].strip(),
+                "send_alert": send, "alert_message": message if send else "", "sources": sources}
+    return check_sources(decision, valid_sections())      # no valid source, no alert
  
  
 def run_weather_agent(tools=REAL_TOOLS, max_steps=MAX_STEPS):
     system = (
-        f"You are a weather agent for {CITY}. Use your tools to check the weather and your own recent decisions. "
+        f"You are a weather agent for {CITY}. Use your tools to check the weather, your own recent decisions "
+        "and the safety guidelines. "
         "Compare today with the recent days and with your past alerts. "
-        "Send an alert only if something unusual or dangerous needs attention, such as extreme heat, "
-        "strong wind or a big change, and only if the history does not show you already alerted about the same thing. "
-        "Never invent numbers. If a tool returns an error, do not guess: say the data is unavailable and do not alert. "
+        "Before you decide on an alert, search the guidelines and follow the rules you find there. "
+        "Send an alert only if the guidelines say the conditions need one, "
+        "and only if the history does not show you already alerted about the same thing. "
+        "Never invent numbers or rules. If a tool returns an error, do not guess: say the data is unavailable and do not alert. "
         "When you are done, reply with JSON only, with exactly these keys: "
         "advice (one or two sentences for a general reader), "
         "reasoning (two or three sentences explaining your decision with numbers), "
         "send_alert (true or false), "
-        "alert_message (a short message, or an empty string if there is no alert)."
+        "alert_message (a short message, or an empty string if there is no alert), "
+        "sources (a list of the guideline section titles you used, or an empty list)."
     )
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": f"Check the weather for {CITY} and decide what to do."}]
@@ -242,7 +320,7 @@ def run_weather_agent(tools=REAL_TOOLS, max_steps=MAX_STEPS):
             if decision:
                 return decision, used
             messages.append({"role": "assistant", "content": msg.get("content") or ""})
-            messages.append({"role": "user", "content": "Reply with the JSON object only, with the 4 keys."})
+            messages.append({"role": "user", "content": "Reply with the JSON object only, with the 5 keys."})
             continue
         messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
         for call in calls:
@@ -268,8 +346,10 @@ def run_agent_job(dry=False):
     print("\nADVICE:", decision["advice"])
     print("REASONING:", decision["reasoning"])
     print("ALERT:", decision["send_alert"], decision["alert_message"])
+    print("SOURCES:", ", ".join(decision["sources"]) or "none")
  
-    payload = {"type": "agent", "city": CITY, "tools_used": ", ".join(used), **decision}
+    payload = {"type": "agent", "city": CITY, "tools_used": ", ".join(used),
+               **decision, "sources": ", ".join(decision["sources"])}
     if dry:
         print("\nDry run. Nothing was sent to the sheet or email.")
         return
@@ -279,7 +359,7 @@ def run_agent_job(dry=False):
         raise SystemExit("The sheet script said: " + response.text)
  
  
-# ---------- 6. Tests: does the agent make the right decision? ----------
+# ---------- 7. Tests: does the agent make the right decision? ----------
 SCENARIOS = [
     {"name": "Normal day",
      "weather": {"city": CITY, "avg_high": 31.0, "avg_low": 21.0, "peak_wind": 12.0,
@@ -288,11 +368,11 @@ SCENARIOS = [
     {"name": "Heatwave",
      "weather": {"city": CITY, "avg_high": 43.0, "avg_low": 30.0, "peak_wind": 14.0,
                  "daily_highs": [38, 41, 43, 45, 48]},
-     "history": [], "expect_alert": True},
+     "history": [], "expect_alert": True, "expect_source": "Heat"},
     {"name": "Storm winds",
      "weather": {"city": CITY, "avg_high": 29.0, "avg_low": 22.0, "peak_wind": 75.0,
                  "daily_highs": [29, 28, 29, 30, 29]},
-     "history": [], "expect_alert": True},
+     "history": [], "expect_alert": True, "expect_source": "Wind"},
     {"name": "Same heatwave, already alerted",
      "weather": {"city": CITY, "avg_high": 44.0, "avg_low": 31.0, "peak_wind": 14.0,
                  "daily_highs": [44, 45, 44, 45, 46]},
@@ -309,22 +389,29 @@ def run_tests():
     passed = 0
     for s in SCENARIOS:
         tools = {"get_weather": lambda city, s=s: s["weather"],
-                 "get_history": lambda n=5, s=s: s["history"]}
+                 "get_history": lambda n=5, s=s: s["history"],
+                 "search_guidelines": tool_search_guidelines}
         decision = apply_guardrails(run_weather_agent(tools)[0])
         ok = decision["send_alert"] == s["expect_alert"]
+        if ok and "expect_source" in s:
+            ok = s["expect_source"] in decision["sources"]
         passed += ok
         print(f"{'PASS' if ok else 'FAIL'} | {s['name']} | expected alert {s['expect_alert']}, "
-              f"got {decision['send_alert']}")
+              f"got {decision['send_alert']}, sources {decision['sources']}")
         print("     ", decision["reasoning"])
         sleep(2)   # be gentle with the free limits
     print(f"\n{passed} of {len(SCENARIOS)} passed")
+    if passed < len(SCENARIOS):
+        raise SystemExit(1)   # a failed test turns the GitHub run red
  
-
- # ---------- Start here ----------
+ 
+# ---------- Start here ----------
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "job"
     if mode == "ask":
         print(run_agent(" ".join(sys.argv[2:])))
+    elif mode == "search":
+        print(search_guidelines(" ".join(sys.argv[2:])))
     elif mode == "dry":
         run_job(dry=True)
     elif mode == "agent":
@@ -335,5 +422,3 @@ if __name__ == "__main__":
         run_tests()
     else:
         run_job()
-
-
