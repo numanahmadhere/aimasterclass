@@ -303,7 +303,7 @@ def run_weather_agent(tools=REAL_TOOLS, max_steps=MAX_STEPS):
         "and only if the history does not show you already alerted about the same thing. "
         "Never invent numbers or rules. If a tool returns an error, do not guess: say the data is unavailable and do not alert. "
         "When you are done, reply with JSON only, with exactly these keys: "
-        "advice (one or two sentences for a general reader), "
+        "advice (one or two sentences for a general reader, include SOPs on what sort of clothes to wear in this weather/temperature), "
         "reasoning (two or three sentences explaining your decision with numbers), "
         "send_alert (true or false), "
         "alert_message (a short message, or an empty string if there is no alert), "
