@@ -293,8 +293,40 @@ def apply_guardrails(d):
     return check_sources(decision, valid_sections())      # no valid source, no alert
  
  
-def run_weather_agent(tools=REAL_TOOLS, max_steps=MAX_STEPS):
-    system = (
+REFLECT = True        # turn reflection on or off
+MAX_REVISIONS = 1     # how many times the agent may revise its draft
+ 
+ 
+def evidence_from(messages):
+    # Everything the tools returned during this run
+    return "\n".join(m["content"] for m in messages if m.get("role") == "tool")
+ 
+ 
+def critique(evidence, draft):
+    # A second pass: a strict reviewer checks the draft against the evidence
+    prompt = (
+        "You are a strict reviewer of a weather agent's draft decision.\n\n"
+        f"Evidence the agent collected:\n{evidence}\n\n"
+        f"Draft decision:\n{json.dumps(draft)}\n\n"
+        "Check: (1) every number in the reasoning appears in the evidence, "
+        "(2) an alert is sent only if a guideline in the evidence says the conditions need one, "
+        "(3) the draft does not repeat an alert that the history shows was already sent. "
+        'Reply with JSON only: {"approved": true or false, "problems": ["..."]}'
+    )
+    reply = ask_groq([{"role": "system", "content": "Reply with JSON only."},
+                      {"role": "user", "content": prompt}], temperature=0)["content"]
+    reply = reply.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        review = json.loads(reply)
+        if isinstance(review.get("approved"), bool) and isinstance(review.get("problems"), list):
+            return review
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return {"approved": True, "problems": []}   # a broken review never blocks; the code guardrails still apply
+ 
+ 
+def agent_system():
+    return (
         f"You are a weather agent for {CITY}. Use your tools to check the weather, your own recent decisions "
         "and the safety guidelines. "
         "Compare today with the recent days and with your past alerts. "
@@ -310,15 +342,30 @@ def run_weather_agent(tools=REAL_TOOLS, max_steps=MAX_STEPS):
         "sources (a list of the guideline section titles you used, or an empty list).
         ""Use each tool at most once. Search the guidelines once, then decide. As soon as you have the weather, your history and one guideline search, stop calling tools and reply with the JSON."
     )
+ 
+ 
+def run_weather_agent(tools=REAL_TOOLS, max_steps=MAX_STEPS):
+    system = agent_system()
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": f"Check the weather for {CITY} and decide what to do."}]
     used = []
+    revisions = 0
     for step in range(1, max_steps + 1):
         msg = ask_groq(messages, tools=AGENT_TOOLS, temperature=0.2)
         calls = msg.get("tool_calls")
         if not calls:
             decision = parse_decision(msg.get("content"))
             if decision:
+                if REFLECT and revisions < MAX_REVISIONS:
+                    review = critique(evidence_from(messages), decision)
+                    print("REVIEW:", "approved" if review["approved"] else "; ".join(review["problems"]))
+                    if not review["approved"]:
+                        revisions += 1
+                        messages.append({"role": "assistant", "content": msg.get("content") or ""})
+                        messages.append({"role": "user", "content": "A reviewer found these problems: "
+                                         + "; ".join(review["problems"])
+                                         + ". Fix them and reply with the JSON object only, with the 5 keys."})
+                        continue
                 return decision, used
             messages.append({"role": "assistant", "content": msg.get("content") or ""})
             messages.append({"role": "user", "content": "Reply with the JSON object only, with the 5 keys."})
@@ -341,8 +388,61 @@ def run_weather_agent(tools=REAL_TOOLS, max_steps=MAX_STEPS):
     raise SystemExit("The agent did not finish in time")
  
  
-def run_agent_job(dry=False):
-    decision, used = run_weather_agent()
+# ---------- 6b. Planning: write the plan first, then carry it out ----------
+PLAN_MAX_STEPS = 4
+ 
+ 
+def make_plan(tools):
+    prompt = (
+        f"Task: check the weather for {CITY} and decide whether an alert is needed.\n"
+        "Tools: get_weather(city), get_history(n), search_guidelines(query).\n"
+        'Write a plan as JSON only: {"steps": [{"tool": "...", "args": {}, "why": "..."}]} '
+        f"with 1 to {PLAN_MAX_STEPS} steps. Plan only the information to collect. The decision comes after the steps."
+    )
+    for attempt in range(2):
+        text = ask_groq([{"role": "system", "content": "Reply with JSON only."},
+                         {"role": "user", "content": prompt}], temperature=0.2)["content"]
+        text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        try:
+            steps = json.loads(text).get("steps")
+        except (json.JSONDecodeError, AttributeError):
+            steps = None
+        ok = (isinstance(steps, list) and 1 <= len(steps) <= PLAN_MAX_STEPS
+              and all(isinstance(x, dict) and x.get("tool") in tools and isinstance(x.get("args", {}), dict)
+                      for x in steps))
+        if ok:
+            return steps
+        print("The plan was not valid, trying again")
+    raise SystemExit("The agent could not make a valid plan")
+ 
+ 
+def run_planned_agent(tools=REAL_TOOLS):
+    steps = make_plan(tools)                  # 1. the AI writes the plan, your code checks it
+    results, used = [], []
+    for i, step in enumerate(steps, 1):       # 2. your code carries out every step
+        args = step.get("args", {})
+        print("PLAN", i, "->", step["tool"], args, "|", step.get("why", ""))
+        try:
+            result = tools[step["tool"]](**args)
+        except TypeError:
+            result = {"error": "bad arguments"}
+        used.append(step["tool"])
+        results.append({"tool": step["tool"], "result": result})
+    messages = [{"role": "system", "content": agent_system()},
+                {"role": "user", "content": "You collected this by following your plan:\n"
+                 + json.dumps(results) + "\nNow decide. Reply with the JSON object only, with the 5 keys."}]
+    for attempt in range(2):                  # 3. the AI decides, using the results
+        msg = ask_groq(messages, temperature=0.2)
+        decision = parse_decision(msg.get("content"))
+        if decision:
+            return decision, used
+        messages.append({"role": "assistant", "content": msg.get("content") or ""})
+        messages.append({"role": "user", "content": "Reply with the JSON object only, with the 5 keys."})
+    raise SystemExit("The agent did not finish in time")
+ 
+ 
+def run_agent_job(dry=False, runner=None):
+    decision, used = (runner or run_weather_agent)()
     decision = apply_guardrails(decision)
     print("\nADVICE:", decision["advice"])
     print("REASONING:", decision["reasoning"])
@@ -380,19 +480,24 @@ SCENARIOS = [
      "history": [{"time": "yesterday", "city": CITY, "advice": "Extreme heat", "alert_sent": True,
                   "alert_message": "Heatwave: highs above 44 C. Stay indoors at midday."}],
      "expect_alert": False},
+    {"name": "Borderline heat (only one day above 40 C)",
+     "weather": {"city": CITY, "avg_high": 39.4, "avg_low": 27.0, "peak_wind": 12.0,
+                 "daily_highs": [38, 39, 41, 40, 39]},
+     "history": [], "expect_alert": False},
     {"name": "Weather service down",
      "weather": {"error": "service unavailable"},
      "history": [], "expect_alert": False},
 ]
  
  
-def run_tests():
+def run_tests(runner=None):
+    runner = runner or run_weather_agent
     passed = 0
     for s in SCENARIOS:
         tools = {"get_weather": lambda city, s=s: s["weather"],
                  "get_history": lambda n=5, s=s: s["history"],
                  "search_guidelines": tool_search_guidelines}
-        decision = apply_guardrails(run_weather_agent(tools)[0])
+        decision = apply_guardrails(runner(tools)[0])
         ok = decision["send_alert"] == s["expect_alert"]
         if ok and "expect_source" in s:
             ok = s["expect_source"] in decision["sources"]
@@ -404,22 +509,3 @@ def run_tests():
     print(f"\n{passed} of {len(SCENARIOS)} passed")
     if passed < len(SCENARIOS):
         raise SystemExit(1)   # a failed test turns the GitHub run red
- 
- 
-# ---------- Start here ----------
-if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "job"
-    if mode == "ask":
-        print(run_agent(" ".join(sys.argv[2:])))
-    elif mode == "search":
-        print(search_guidelines(" ".join(sys.argv[2:])))
-    elif mode == "dry":
-        run_job(dry=True)
-    elif mode == "agent":
-        run_agent_job()
-    elif mode == "agent-dry":
-        run_agent_job(dry=True)
-    elif mode == "test":
-        run_tests()
-    else:
-        run_job()
