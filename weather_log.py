@@ -509,3 +509,29 @@ def run_tests(runner=None):
     print(f"\n{passed} of {len(SCENARIOS)} passed")
     if passed < len(SCENARIOS):
         raise SystemExit(1)   # a failed test turns the GitHub run red
+
+
+        # ---------- Start here ----------
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "job"
+    if mode == "ask":
+        print(run_agent(" ".join(sys.argv[2:])))
+    elif mode == "search":
+        print(search_guidelines(" ".join(sys.argv[2:])))
+    elif mode == "dry":
+        run_job(dry=True)
+    elif mode == "agent":
+        run_agent_job()
+    elif mode == "agent-dry":
+        run_agent_job(dry=True)
+    elif mode == "plan":
+        run_agent_job(runner=run_planned_agent)
+    elif mode == "plan-dry":
+        run_agent_job(dry=True, runner=run_planned_agent)
+    elif mode == "test":
+        run_tests()
+    elif mode == "test-plan":
+        run_tests(run_planned_agent)
+    else:
+        run_job()
+
